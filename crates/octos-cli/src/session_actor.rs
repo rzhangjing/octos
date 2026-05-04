@@ -205,6 +205,29 @@ fn save_retry_state(path: &std::path::Path, state: &LoopRetryState) {
     }
 }
 
+/// PR F (M8.10): pick a `thread_id` for an Assistant row when the caller
+/// didn't supply one and we want to honor the new-write fail-closed split.
+/// Walks `history` backwards for the most-recent User; falls back to a
+/// freshly-synthesized UUIDv7 (mirrors the legacy synthesizer's
+/// `synth_{seq}` shape but with temporal ordering).
+///
+/// Use ONLY for foreground turns on linear single-channel transcripts
+/// (CLI / telegram / discord) — these never have the concurrent-sibling
+/// problem #649 documented (one user at a time on the wire).
+fn fallback_thread_id_for_assistant(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, MessageRole::User))
+        .and_then(|user| {
+            user.thread_id
+                .clone()
+                .or_else(|| user.client_message_id.clone())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
+}
+
 async fn persist_assistant_message(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
@@ -213,8 +236,12 @@ async fn persist_assistant_message(
     media: Vec<String>,
     thread_id: Option<String>,
 ) -> Option<PersistedSessionMessage> {
-    let mut assistant_msg = Message::assistant(content);
-    assistant_msg.media = media;
+    // PR A: prefer the typed constructor when the originating thread is
+    // known so the type system rejects a future regression that drops the
+    // pre-stamp. `assistant_with_thread` is the structural fix Codex's
+    // critique called out for the M8.10 thread-binding bug class
+    // (#649 → #664 → #673 → #680 → #738 → #740).
+    //
     // M8.10 follow-up (#649): pre-stamp `thread_id` BEFORE handing the
     // message to the canonical persist helper. `add_message_with_seq`'s
     // derivation falls back to "most recent user in history" — for a
@@ -223,13 +250,51 @@ async fn persist_assistant_message(
     // originating turn (background results carry `originating_thread_id`
     // through `BackgroundResultPayload`), passing it here pins the
     // persisted JSONL row to the correct thread so reload pairs the
-    // assistant under the originating user bubble. Foreground turns pass
-    // `None` and continue to use the derivation fallback (correct).
-    if let Some(tid) = thread_id {
-        if !tid.is_empty() {
-            assistant_msg.thread_id = Some(tid);
+    // assistant under the originating user bubble.
+    //
+    // PR F (M8.10): the fail-closed split in
+    // `derive_thread_id_for_new_write` means callers MUST supply
+    // `thread_id` for Assistant rows. Foreground turns on linear
+    // single-channel transcripts (CLI / telegram / discord) where the
+    // session_actor has no `client_message_id` to forward fall back to
+    // the load-style derivation here — those channels never have the
+    // concurrent-sibling problem #649 documented (one user at a time on
+    // the wire), so deriving from the most-recent user is safe.
+    let resolved_thread_id = match thread_id {
+        Some(tid) if !tid.is_empty() => Some(tid),
+        _ => {
+            // Linear-channel fallback: derive from history. Holding the
+            // lock briefly to read messages is fine — we're about to
+            // re-acquire below for the persist itself.
+            let handle = session_handle.lock().await;
+            handle
+                .session()
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, MessageRole::User))
+                .and_then(|user| {
+                    user.thread_id
+                        .clone()
+                        .or_else(|| user.client_message_id.clone())
+                })
         }
-    }
+    };
+    let mut assistant_msg = match resolved_thread_id {
+        Some(tid) if !tid.is_empty() => {
+            Message::assistant_with_thread(content, octos_core::ThreadId::new(tid))
+        }
+        _ => {
+            // Orphan assistant (no user in history). Synthesize a stable
+            // UUIDv7 thread_id so the persist still succeeds — this
+            // mirrors the legacy synthesizer's `synth_{seq}` shape but
+            // uses UUIDv7 for temporal ordering. Rare: only fires for
+            // System-primer transcripts.
+            let synth = uuid::Uuid::now_v7().to_string();
+            Message::assistant_with_thread(content, octos_core::ThreadId::new(synth))
+        }
+    };
+    assistant_msg.media = media;
     let timestamp = assistant_msg.timestamp;
 
     // Funnel through the canonical helper so the per-key Tokio mutex
@@ -698,7 +763,14 @@ async fn persist_child_session_lifecycle(
                     message.role == MessageRole::Assistant && message.content == note
                 });
             if !exists {
-                child.add_message(Message::assistant(note)).await?;
+                // PR F (M8.10): the child session terminal note is a
+                // synthetic Assistant row injected by the lifecycle
+                // helper. Use the linear-channel fallback to derive a
+                // thread_id from the child's history (or synthesize
+                // a UUIDv7 if the child is brand new).
+                let tid = fallback_thread_id_for_assistant(&child.session().messages);
+                let note_msg = Message::assistant_with_thread(note, octos_core::ThreadId::new(tid));
+                child.add_message(note_msg).await?;
             }
             let contract = ChildSessionContract {
                 task_id: payload.task_id.clone(),
@@ -2445,6 +2517,7 @@ impl ActorFactory {
             persistent_retry_state,
             retry_state_path: Some(retry_state_path),
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -2623,6 +2696,15 @@ struct SessionActor {
     /// turn (M8.9). Caps recovery at one attempt per task so a recovery
     /// turn that itself fails cannot ignite a runaway loop.
     recovered_tasks: Arc<StdMutex<std::collections::HashSet<String>>>,
+    /// Codex pre-merge review of #748 P1.2: cmid of the inbound currently
+    /// being handled by `try_handle_command`. `send_reply` reads this so
+    /// slash-command replies + `_completion` events stamp `thread_id` from
+    /// the originating turn instead of falling back to the per-chat sticky
+    /// map (which would mis-route replies to a sibling turn under
+    /// rapid-fire interleave). Set at the top of `try_handle_command`,
+    /// cleared at the end. `None` outside command handling — `send_reply`
+    /// then falls back to legacy behavior (stamping no thread_id).
+    current_command_cmid: Option<String>,
 }
 
 impl SessionActor {
@@ -2975,10 +3057,30 @@ impl SessionActor {
             return false;
         }
 
+        // Codex pre-merge review of #748 P1.2: stash the originating turn's
+        // cmid so `send_reply` can stamp `thread_id` in metadata. Without
+        // this, slash-command replies + `_completion` events emit with
+        // empty metadata and `ApiChannel::send` falls back to the per-chat
+        // sticky map — which has been seeded by every queued/overlapping
+        // user message, so reply A can land under bubble B.
+        //
+        // Set here, cleared at end of this function (and on early returns
+        // via the same drop pattern).
+        self.current_command_cmid = message
+            .metadata
+            .get("client_message_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // Defensive: clear at the tail-cleanup line just before the
+        // function returns (see end of this fn). Single-actor task means
+        // no concurrent reader can observe the transient field; all
+        // command handlers `await` and return back here.
+
         let parts: Vec<&str> = text.split_whitespace().collect();
         let cmd = parts[0];
 
-        match cmd {
+        let consumed = match cmd {
             "/adaptive" => {
                 self.handle_adaptive_command(&parts[1..]).await;
                 true
@@ -3017,7 +3119,14 @@ impl SessionActor {
                 .await;
                 true
             }
-        }
+        };
+
+        // Codex pre-merge review of #748 P1.2: clear cmid stash so any
+        // subsequent non-command message handling (sent later via the
+        // normal turn flow) doesn't accidentally re-stamp using this
+        // command's cmid.
+        self.current_command_cmid = None;
+        consumed
     }
 
     /// `/adaptive` — view or toggle adaptive routing features.
@@ -3427,7 +3536,32 @@ impl SessionActor {
     }
 
     /// Send a short reply to the user (for command responses).
+    ///
+    /// Codex pre-merge review of #748 P1.2: when the reply is to a slash
+    /// command (i.e. `try_handle_command` set `current_command_cmid`),
+    /// stamp `thread_id` in metadata so `ApiChannel::send` does NOT fall
+    /// back to the per-chat sticky map. Without this, queued/overlapping
+    /// command A could be emitted with sticky B and land under bubble B.
     async fn send_reply(&self, content: &str) {
+        let mut reply_metadata = serde_json::json!({});
+        let mut completion_metadata = serde_json::json!({"_completion": true});
+        if let Some(cmid) = self.current_command_cmid.as_deref() {
+            if !cmid.is_empty() {
+                if let serde_json::Value::Object(ref mut m) = reply_metadata {
+                    m.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(cmid.to_string()),
+                    );
+                }
+                if let serde_json::Value::Object(ref mut m) = completion_metadata {
+                    m.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(cmid.to_string()),
+                    );
+                }
+            }
+        }
+
         let _ = self
             .out_tx
             .send(OutboundMessage {
@@ -3436,7 +3570,7 @@ impl SessionActor {
                 content: content.to_string(),
                 reply_to: None,
                 media: vec![],
-                metadata: serde_json::json!({}),
+                metadata: reply_metadata,
             })
             .await;
 
@@ -3450,7 +3584,7 @@ impl SessionActor {
                     content: String::new(),
                     reply_to: None,
                     media: vec![],
-                    metadata: serde_json::json!({"_completion": true}),
+                    metadata: completion_metadata,
                 })
                 .await;
         }
@@ -3952,16 +4086,18 @@ impl SessionActor {
         };
 
         let client_message_id = inbound_client_message_id(inbound);
-        let user_msg = Message {
-            role: MessageRole::User,
-            content: persisted_user_content.to_string(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: client_message_id.clone(),
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
+        // PR A: when the inbound carries a cmid, build the user message via
+        // the typed constructor — `user_with_cmid` requires the
+        // `ClientMessageId` argument so the cmid cannot be silently dropped.
+        // `thread_id` stays `None` here because `add_message_with_seq` runs
+        // its own derivation; PR-F will migrate that derivation onto the
+        // typed setters.
+        let user_msg = match client_message_id.as_deref() {
+            Some(cmid) if !cmid.is_empty() => Message::user_with_cmid(
+                persisted_user_content.to_string(),
+                octos_core::ClientMessageId::new(cmid),
+            ),
+            _ => Message::user(persisted_user_content.to_string()),
         };
         let user_msg_timestamp = user_msg.timestamp;
         let user_seq = {
@@ -4180,21 +4316,21 @@ impl SessionActor {
         let client_message_id = inbound_client_message_id(&inbound);
         let persisted_user_content_for_event = persisted_user_content.clone();
         let user_media_for_event = image_media.clone();
-        let user_msg = Message {
-            role: MessageRole::User,
-            content: persisted_user_content,
-            media: image_media
-                .iter()
-                .chain(attachment_media.iter())
-                .cloned()
-                .collect(),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: client_message_id.clone(),
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
+        // PR A: typed constructor for the cmid-bearing path; legacy
+        // `Message::user` for the rare cmid-less path. See sibling site
+        // around line 3961 for the rationale.
+        let mut user_msg = match client_message_id.as_deref() {
+            Some(cmid) if !cmid.is_empty() => Message::user_with_cmid(
+                persisted_user_content,
+                octos_core::ClientMessageId::new(cmid),
+            ),
+            _ => Message::user(persisted_user_content),
         };
+        user_msg.media = image_media
+            .iter()
+            .chain(attachment_media.iter())
+            .cloned()
+            .collect();
         let user_msg_timestamp = user_msg.timestamp;
         let user_seq = {
             let mut handle = self.session_handle.lock().await;
@@ -4234,13 +4370,19 @@ impl SessionActor {
                 .get("voice_transcript")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            si.start(
+            // PR F (M8.10) — codex review P1 #1: bind the originating
+            // turn's `client_message_id` to the status composer so its
+            // `edit_message_bound` calls and initial `send_with_id`
+            // metadata route to THIS turn's bubble, even when sticky
+            // has rotated under rapid-fire concurrent writes.
+            si.start_with_thread(
                 self.chat_id.clone(),
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
                 self.sender_user_id.clone(),
+                client_message_id.clone(),
             )
         });
 
@@ -4705,6 +4847,25 @@ impl SessionActor {
                     } else {
                         &conv_response.messages
                     };
+                    // PR F (M8.10): cache the linear-channel fallback once
+                    // up front so all intermediate Assistant/Tool rows of
+                    // this turn share the same thread_id. Codex's PR-F
+                    // review (P1 #2) flagged that the per-message
+                    // pre-stamp dropped intermediate rows on linear
+                    // channels (CLI/telegram/discord) where
+                    // `client_message_id` is None — those rows now
+                    // hit the new-write fail-closed split and get
+                    // dropped silently. Computing the fallback once
+                    // here keeps the whole turn pinned to one thread.
+                    let linear_fallback_for_turn: Option<String> = if client_message_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        Some(fallback_thread_id_for_assistant(&handle.session().messages))
+                    } else {
+                        None
+                    };
                     for msg in messages_to_save {
                         // Issue #740 fix: pre-stamp `thread_id` on Assistant /
                         // Tool messages produced inside the agent loop. The
@@ -4721,6 +4882,11 @@ impl SessionActor {
                         // the persisted JSONL row to the correct thread, the
                         // same fix shape PR #739 applied to the M8.9 spawn_only
                         // recovery path.
+                        //
+                        // PR F (M8.10): when `client_message_id` is absent
+                        // (linear channels), use the cached
+                        // `linear_fallback_for_turn` so intermediate
+                        // Assistant/Tool rows pass the fail-closed split.
                         let mut to_save = msg.clone();
                         if to_save.thread_id.is_none()
                             && matches!(to_save.role, MessageRole::Assistant | MessageRole::Tool)
@@ -4729,6 +4895,8 @@ impl SessionActor {
                                 if !tid.is_empty() {
                                     to_save.thread_id = Some(tid.clone());
                                 }
+                            } else if let Some(ref tid) = linear_fallback_for_turn {
+                                to_save.thread_id = Some(tid.clone());
                             }
                         }
                         if let Err(e) = handle.add_message(to_save).await {
@@ -4741,29 +4909,45 @@ impl SessionActor {
                     // `messages` (EndTurn returns early without appending).
                     // Persist it explicitly so session history is complete.
                     if !conv_response.content.is_empty() {
-                        let assistant_msg = Message {
-                            role: MessageRole::Assistant,
-                            content: final_content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: conv_response.reasoning_content.clone(),
-                            client_message_id: None,
-                            // Issue #740 fix: pre-stamp `thread_id` from the
-                            // originating turn's cmid so the persisted JSONL
-                            // row is pinned to the correct thread. Without
-                            // this, `add_message_with_seq`'s "most recent
-                            // user in history" derivation picks the LATEST
-                            // user message — which under rapid-fire is a
-                            // sibling overflow user, not THIS turn — and
-                            // reload mis-pairs the assistant under the
-                            // wrong bubble (live-overflow-stress mini3
-                            // `rapid-fire-five-fast` evidence: 1+1=2 rendered
-                            // under the 3+3 bubble). Mirrors PR #739's M8.9
-                            // recovery-path fix for the foreground SSE path.
-                            thread_id: client_message_id.clone(),
-                            timestamp: chrono::Utc::now(),
+                        // PR A: when the originating turn supplied a cmid,
+                        // build via `assistant_with_thread` so the typed
+                        // ThreadId argument can't be silently dropped.
+                        // Issue #740 fix: pre-stamp `thread_id` from the
+                        // originating turn's cmid so the persisted JSONL
+                        // row is pinned to the correct thread. Without
+                        // this, `add_message_with_seq`'s "most recent
+                        // user in history" derivation picks the LATEST
+                        // user message — which under rapid-fire is a
+                        // sibling overflow user, not THIS turn — and
+                        // reload mis-pairs the assistant under the
+                        // wrong bubble (live-overflow-stress mini3
+                        // `rapid-fire-five-fast` evidence: 1+1=2 rendered
+                        // under the 3+3 bubble). Mirrors PR #739's M8.9
+                        // recovery-path fix for the foreground SSE path.
+                        //
+                        // PR F (M8.10): non-API channels (CLI/telegram/etc.)
+                        // arrive with `client_message_id == None`. The
+                        // session.rs new-write split fail-closes for
+                        // unbound Assistant rows; on those linear
+                        // single-channel transcripts (one user at a time
+                        // on the wire) deriving from the most-recent
+                        // user is structurally safe. Use the helper to
+                        // keep the fallback in one place.
+                        let mut assistant_msg = match client_message_id.as_deref() {
+                            Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                                final_content.clone(),
+                                octos_core::ThreadId::new(tid),
+                            ),
+                            _ => {
+                                let tid =
+                                    fallback_thread_id_for_assistant(&handle.session().messages);
+                                Message::assistant_with_thread(
+                                    final_content.clone(),
+                                    octos_core::ThreadId::new(tid),
+                                )
+                            }
                         };
+                        assistant_msg.reasoning_content = conv_response.reasoning_content.clone();
                         // M8.10-A: capture the committed seq so the SSE `done`
                         // event can thread it back to the web client. The
                         // assistant timestamp is `Utc::now()` (newer than any
@@ -4837,15 +5021,35 @@ impl SessionActor {
                             chat_id = %self.chat_id,
                             "auto-delivering report file"
                         );
+                        // Codex pre-merge review of #748 P1: media metadata
+                        // must carry `thread_id` so `ApiChannel::send` does
+                        // NOT fall back to sticky-map lookup. Without this,
+                        // an A/B race where B's request seeds sticky after
+                        // A's user row but before A's report delivery causes
+                        // A's file row to land under B's bubble (same leak
+                        // class the rest of PR F closes elsewhere).
+                        let mut file_metadata = serde_json::json!({
+                            "topic": self.session_key.topic(),
+                        });
+                        let report_thread_id = client_message_id
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        if let Some(tid) = report_thread_id.as_deref() {
+                            if let serde_json::Value::Object(ref mut m) = file_metadata {
+                                m.insert(
+                                    "thread_id".to_string(),
+                                    serde_json::Value::String(tid.to_string()),
+                                );
+                            }
+                        }
                         let file_msg = OutboundMessage {
                             channel: self.channel.clone(),
                             chat_id: self.chat_id.clone(),
                             content: String::new(),
                             reply_to: None,
                             media: vec![abs_file.to_string_lossy().into_owned()],
-                            metadata: serde_json::json!({
-                                "topic": self.session_key.topic()
-                            }),
+                            metadata: file_metadata,
                         };
                         if let Err(e) = self.out_tx.send(file_msg).await {
                             warn!(session = %self.session_key, error = %e, "failed to auto-deliver report file");
@@ -5116,17 +5320,17 @@ impl SessionActor {
             // primary turn or this overflow agent fails — preserves the user's
             // query in the session log no matter what.
             let user_msg_timestamp = chrono::Utc::now();
-            let user_msg = Message {
-                role: MessageRole::User,
-                content: content.clone(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: overflow_client_message_id.clone(),
-                thread_id: None,
-                timestamp: user_msg_timestamp,
+            // PR A: typed user-message construction for the overflow path.
+            // The cmid is mandatory for routing the response back to the
+            // right SPA bubble — typing it here means a regression that
+            // strips it would fail to compile.
+            let mut user_msg = match overflow_client_message_id.as_deref() {
+                Some(cmid) if !cmid.is_empty() => {
+                    Message::user_with_cmid(content.clone(), octos_core::ClientMessageId::new(cmid))
+                }
+                _ => Message::user(content.clone()),
             };
+            user_msg.timestamp = user_msg_timestamp;
             let user_seq_for_overflow = {
                 let mut handle = session_handle.lock().await;
                 handle.add_message_with_seq(user_msg).await.ok()
@@ -5238,14 +5442,20 @@ impl SessionActor {
             let tracker = Arc::new(TokenTracker::new());
 
             // ── Per-overflow status indicator (own "✦ Thinking..." message) ──
+            //
+            // PR F (M8.10): bind the overflow turn's cmid to the status
+            // composer so its wire events route to the OVERFLOW
+            // bubble, not whatever sticky/primary turn the chat is
+            // currently on.
             let status_handle = status_indicator.as_ref().map(|si| {
-                si.start(
+                si.start_with_thread(
                     chat_id.clone(),
                     &content,
                     Arc::clone(&tracker),
                     None,
                     &user_status_config,
                     sender_user_id.clone(),
+                    overflow_client_message_id.clone(),
                 )
             });
 
@@ -5367,29 +5577,40 @@ impl SessionActor {
                     // primary turn completed — and would be silently dropped
                     // (FA-11 defect B).
                     let final_reply_timestamp = chrono::Utc::now();
-                    let final_reply = Message {
-                        role: MessageRole::Assistant,
-                        content: final_content.clone(),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: conv_response.reasoning_content.clone(),
-                        client_message_id: None,
-                        // Issue #740 fix: pre-stamp `thread_id` with the
-                        // overflow user's own cmid. Without this, when
-                        // multiple rapid-fire overflow tasks finalise in
-                        // an out-of-order sequence (e.g. Q2's reply lands
-                        // after Q5's user message has been persisted),
-                        // `add_message_with_seq`'s derivation fallback
-                        // picks the latest user (Q5) instead of THIS
-                        // overflow's originating user (Q2), and the
-                        // persisted JSONL row mis-binds the reply under
-                        // Q5's bubble on reload. Mirrors PR #739's
-                        // BackgroundResult fix for the speculative-
-                        // overflow code path.
-                        thread_id: overflow_client_message_id.clone(),
-                        timestamp: final_reply_timestamp,
+                    // PR A: typed assistant-message construction for the
+                    // speculative-overflow path. Issue #740 fix: pre-stamp
+                    // `thread_id` with the overflow user's own cmid.
+                    // Without this, when multiple rapid-fire overflow tasks
+                    // finalise in an out-of-order sequence (e.g. Q2's reply
+                    // lands after Q5's user message has been persisted),
+                    // `add_message_with_seq`'s derivation fallback picks
+                    // the latest user (Q5) instead of THIS overflow's
+                    // originating user (Q2), and the persisted JSONL row
+                    // mis-binds the reply under Q5's bubble on reload.
+                    // Mirrors PR #739's BackgroundResult fix for the
+                    // speculative-overflow code path.
+                    let mut final_reply = match overflow_client_message_id.as_deref() {
+                        Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                            final_content.clone(),
+                            octos_core::ThreadId::new(tid),
+                        ),
+                        _ => {
+                            // PR F (M8.10): non-API channels arrive
+                            // without cmid. Derive from history under
+                            // the session_handle lock so the persist
+                            // succeeds with the new-write fail-closed
+                            // split. See `fallback_thread_id_for_assistant`.
+                            let handle = session_handle.lock().await;
+                            let tid = fallback_thread_id_for_assistant(&handle.session().messages);
+                            drop(handle);
+                            Message::assistant_with_thread(
+                                final_content.clone(),
+                                octos_core::ThreadId::new(tid),
+                            )
+                        }
                     };
+                    final_reply.reasoning_content = conv_response.reasoning_content.clone();
+                    final_reply.timestamp = final_reply_timestamp;
                     let committed_seq = {
                         let mut handle = session_handle.lock().await;
                         handle
@@ -5635,6 +5856,10 @@ impl SessionActor {
         let token_tracker = Arc::new(TokenTracker::new());
 
         // Start status indicator
+        //
+        // PR F (M8.10) — codex review P1 #1: bind the inbound's cmid
+        // to the status composer so its wire events route to the
+        // correct turn under rapid-fire concurrent writes.
         let status_handle = self.status_indicator.as_ref().map(|si| {
             let voice_transcript = inbound
                 .metadata
@@ -5642,13 +5867,14 @@ impl SessionActor {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            si.start(
+            si.start_with_thread(
                 self.chat_id.clone(),
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
                 self.sender_user_id.clone(),
+                client_message_id.clone(),
             )
         });
 
@@ -5832,6 +6058,19 @@ impl SessionActor {
                         }
                     }
 
+                    // PR F (M8.10): cache the linear-channel fallback
+                    // once per turn so intermediate Assistant/Tool rows
+                    // share a stable thread_id when no `client_message_id`
+                    // is supplied. See codex's PR-F review P1 #2.
+                    let recovery_linear_fallback: Option<String> = if client_message_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        Some(fallback_thread_id_for_assistant(&handle.session().messages))
+                    } else {
+                        None
+                    };
                     let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
                         let message_to_save =
@@ -5864,6 +6103,11 @@ impl SessionActor {
                                 // history (which can be a sibling rapid-fire
                                 // turn that landed in the JSONL between this
                                 // turn's user persist and assistant persist).
+                                //
+                                // PR F (M8.10): when client_message_id is
+                                // absent (linear channels), use the cached
+                                // recovery_linear_fallback so intermediate
+                                // rows pass the fail-closed split.
                                 if to_save.thread_id.is_none()
                                     && matches!(
                                         to_save.role,
@@ -5874,6 +6118,8 @@ impl SessionActor {
                                         if !tid.is_empty() {
                                             to_save.thread_id = Some(tid.clone());
                                         }
+                                    } else if let Some(ref tid) = recovery_linear_fallback {
+                                        to_save.thread_id = Some(tid.clone());
                                     }
                                 }
                                 to_save
@@ -5888,21 +6134,32 @@ impl SessionActor {
                     // `messages` (EndTurn returns early without appending).
                     // Persist it explicitly so session history is complete.
                     if !conv_response.content.is_empty() {
-                        let assistant_msg = Message {
-                            role: MessageRole::Assistant,
-                            content: final_content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: conv_response.reasoning_content.clone(),
-                            client_message_id: None,
-                            // Issue #740 fix: pre-stamp `thread_id` from the
-                            // originating turn's cmid so reload pairs the
-                            // assistant under the correct user bubble.
-                            // Sibling fix to PR #739's M8.9 recovery path.
-                            thread_id: client_message_id.clone(),
-                            timestamp: chrono::Utc::now(),
+                        // PR A: when we know the originating cmid, build the
+                        // assistant Message via the typed constructor — that
+                        // requires the ThreadId argument at the type level so
+                        // a future regression cannot silently drop the
+                        // pre-stamp. Issue #740 fix: pre-stamp `thread_id`
+                        // from the originating turn's cmid so reload pairs
+                        // the assistant under the correct user bubble.
+                        // Sibling fix to PR #739's M8.9 recovery path.
+                        //
+                        // PR F (M8.10): linear-channel fallback when no
+                        // cmid is present. See site 1 above.
+                        let mut assistant_msg = match client_message_id.as_deref() {
+                            Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                                final_content.clone(),
+                                octos_core::ThreadId::new(tid),
+                            ),
+                            _ => {
+                                let tid =
+                                    fallback_thread_id_for_assistant(&handle.session().messages);
+                                Message::assistant_with_thread(
+                                    final_content.clone(),
+                                    octos_core::ThreadId::new(tid),
+                                )
+                            }
                         };
+                        assistant_msg.reasoning_content = conv_response.reasoning_content.clone();
                         if let Err(e) = handle.add_message(assistant_msg).await {
                             warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
                         }
@@ -7269,6 +7526,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7340,6 +7598,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7417,6 +7676,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7541,6 +7801,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7661,6 +7922,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7753,6 +8015,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7844,6 +8107,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -10434,7 +10698,10 @@ mod tests {
             .await
             .unwrap();
         parent_handle
-            .add_message(Message::assistant("Starting research"))
+            .add_message(Message::assistant_with_thread(
+                "Starting research",
+                octos_core::ThreadId::new("test-thread"),
+            ))
             .await
             .unwrap();
 
@@ -10677,7 +10944,10 @@ mod tests {
                 .await
                 .expect("seed user");
             handle
-                .add_message(Message::assistant("hello, where to?"))
+                .add_message(Message::assistant_with_thread(
+                    "hello, where to?",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await
                 .expect("seed assistant");
         }
@@ -10701,7 +10971,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let mut handle = writer_handle.lock().await;
             let _ = handle
-                .add_message(Message::assistant("Saratoga: 72°F sunny"))
+                .add_message(Message::assistant_with_thread(
+                    "Saratoga: 72°F sunny",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await;
         });
 
@@ -10746,7 +11019,10 @@ mod tests {
                 .await
                 .expect("seed user");
             handle
-                .add_message(Message::assistant("hello, where to?"))
+                .add_message(Message::assistant_with_thread(
+                    "hello, where to?",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await
                 .expect("seed assistant");
         }
@@ -10799,7 +11075,10 @@ mod tests {
             let mut handle = session_handle.lock().await;
             handle.add_message(Message::user("q")).await.expect("seed");
             handle
-                .add_message(Message::assistant("a"))
+                .add_message(Message::assistant_with_thread(
+                    "a",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await
                 .expect("seed");
         }
@@ -11256,7 +11535,16 @@ mod tests {
                 } else {
                     // "Channel" path — the canonical helper directly (this is
                     // the same code `ApiChannel::persist_to_session` calls).
-                    let assistant = Message::assistant(format!("channel-{i}"));
+                    //
+                    // PR F (M8.10): the canonical helper now fails closed
+                    // for unbound Assistant rows. Production callers
+                    // (`ApiChannel::persist_to_session`) pre-stamp via the
+                    // typed `Message::assistant_with_thread`. The test
+                    // mirrors that.
+                    let assistant = Message::assistant_with_thread(
+                        format!("channel-{i}"),
+                        octos_core::ThreadId::new(format!("test-thread-{i}")),
+                    );
                     octos_bus::session::persist_message_through_canonical_path(
                         &data_dir, &key, assistant,
                     )
