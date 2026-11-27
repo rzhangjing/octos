@@ -925,12 +925,24 @@ fn tokio_monitor_command(config: &MonitorWatchConfig) -> tokio::process::Command
 /// (the probe cannot influence it); `--` guards the negative pid from being
 /// parsed as a flag (GNU/procps `kill`). No-op on a group that already exited.
 struct ChildGroupGuard {
+    /// The probe's process-group-leader pid. Read only by the Unix GROUP
+    /// reaper in `Drop`; other platforms have no portable group kill, so the
+    /// pid is not stored (`kill_on_drop` still reaps the leader).
+    #[cfg(unix)]
     pid: Option<u32>,
 }
 
 impl ChildGroupGuard {
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn arm(pid: Option<u32>) -> Self {
-        Self { pid }
+        #[cfg(unix)]
+        {
+            Self { pid }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
     }
 }
 

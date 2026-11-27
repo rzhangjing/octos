@@ -71,8 +71,14 @@ pub enum GoalSubcommand {
 // ([`GoalStatusView`]) so the two modes can never diverge.
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use serde::Deserialize;
+use serde::Serialize;
 
+// The operator-control socket exists only on Unix (serve binds it; the CLI
+// connects to it), so its wire types and paths are gated to match. On Windows
+// `online_transition` is the offline append-only fallback with no socket.
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct GoalOperatorControlRequest {
     method: String,
@@ -83,7 +89,9 @@ struct GoalOperatorControlRequest {
     reason: String,
 }
 
+#[cfg(unix)]
 impl GoalOperatorControlRequest {
+    /// Reconcile target status for an accepted action.
     #[cfg(feature = "api")]
     fn action_target_status(&self) -> &str {
         match self.action.as_str() {
@@ -94,6 +102,7 @@ impl GoalOperatorControlRequest {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct GoalOperatorControlResponse {
     ok: bool,
@@ -103,7 +112,9 @@ struct GoalOperatorControlResponse {
     error: Option<String>,
 }
 
+#[cfg(unix)]
 const GOAL_OPERATOR_CONTROL_SOCKET: &str = ".octos-goal-control.sock";
+#[cfg(unix)]
 const GOAL_OPERATOR_TRANSITION_METHOD: &str = "session/goal/operator_transition";
 
 /// `sun_path` capacity for a bound unix socket. The terminating NUL is not

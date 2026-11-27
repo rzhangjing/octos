@@ -96,6 +96,9 @@ pub(crate) fn mutate(
             "invalid file path",
         ));
     }
+    // Only the Unix descriptor walk addresses the entry by name; the fallback
+    // below operates on the full path.
+    #[cfg(unix)]
     let leaf = relative
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?;
